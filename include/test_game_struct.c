@@ -5,7 +5,7 @@ int main() {
     printf("GameState size: %lu bytes\n", sizeof(GameState));
     printf("PlayerState size: %lu bytes\n", sizeof(PlayerState));
     printf("MAX_PLAYERS: %d\n", MAX_PLAYERS);
-    printf("MAX_CARDS_PER_PLAYER: %d\n", MAX_CARDS_PER_PLAYER);
+    printf("MAX_CARDS: %d\n", MAX_CARDS);
     
     // 测试是否可以创建局部实例
     GameState local_gs;
