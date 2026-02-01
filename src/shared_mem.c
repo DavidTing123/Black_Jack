@@ -2,159 +2,102 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <semaphore.h>
-#include <unistd.h>
 #include <string.h>
-#include <errno.h>
-#include "../include/game_state.h"
+#include <unistd.h>
+#include "game_state.h"
 
-// Initialize shared memory
+// 初始化共享内存
 GameState* init_shared_memory() {
-    int shm_fd;
-    GameState *game_state = NULL;
+    int fd;
+    GameState *gs;
     
-    printf("[SHM] Initializing shared memory...\n");
-    
-    // 1. Create/open shared memory object
-    shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd == -1) {
-        perror("[ERROR] shm_open failed");
+    // 1. 创建共享内存对象
+    fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        perror("shm_open");
         return NULL;
     }
     
-    // 2. Set size
-    if (ftruncate(shm_fd, sizeof(GameState)) == -1) {
-        perror("[ERROR] ftruncate failed");
-        close(shm_fd);
+    // 2. 设置大小
+    if (ftruncate(fd, sizeof(GameState)) < 0) {
+        perror("ftruncate");
+        close(fd);
         return NULL;
     }
     
-    // 3. Map to process address space
-    game_state = (GameState*)mmap(NULL, sizeof(GameState),
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_SHARED, shm_fd, 0);
-    if (game_state == MAP_FAILED) {
-        perror("[ERROR] mmap failed");
-        close(shm_fd);
+    // 3. 内存映射
+    gs = mmap(NULL, sizeof(GameState), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (gs == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
         return NULL;
     }
+    close(fd);
     
-    close(shm_fd);  // File descriptor no longer needed
-    
-    // 4. First-time initialization
+    // 4. 首次使用时初始化
     static int first_time = 1;
     if (first_time) {
-        memset(game_state, 0, sizeof(GameState));
+        memset(gs, 0, sizeof(GameState));
         
-        // Initialize players
+        // 初始化玩家
         for (int i = 0; i < MAX_PLAYERS; i++) {
-            game_state->players[i].player_id = i + 1;
-            game_state->players[i].card_count = 0;
-            game_state->players[i].points = 0;
-            game_state->players[i].connected = false;
-            game_state->players[i].active = false;
-            game_state->players[i].standing = false;
-            game_state->players[i].last_active = time(NULL);
-            
-            // Initialize cards to -1 (empty)
+            gs->players[i].player_id = i + 1;
             for (int j = 0; j < MAX_CARDS; j++) {
-                game_state->players[i].cards[j] = -1;
+                gs->players[i].cards[j] = -1;
             }
         }
         
-        // Initialize deck
+        // 初始化牌堆
         for (int i = 0; i < DECK_SIZE; i++) {
-            game_state->deck[i] = (i % 13) + 1;
+            gs->deck[i] = (i % 13) + 1;
         }
-        game_state->deck_idx = 0;
-        
-        // Initialize game state
-        game_state->current_turn = 0;
-        game_state->active_count = 0;
-        game_state->connected_count = 0;
-        game_state->game_active = false;
-        game_state->game_over = false;
-        game_state->winner = -1;
         
         first_time = 0;
         printf("[SHM] First-time initialization complete\n");
     }
     
-    // 5. Create/open process-shared semaphores
-    game_state->turn_sem = sem_open(SEM_TURN, O_CREAT, 0666, 1);
-    game_state->deck_sem = sem_open(SEM_DECK, O_CREAT, 0666, 1);
-    game_state->score_sem = sem_open(SEM_SCORE, O_CREAT, 0666, 1);
+    // 5. 创建信号量（进程共享）
+    gs->turn_sem = sem_open(SEM_TURN, O_CREAT, 0666, 1);
+    gs->deck_sem = sem_open(SEM_DECK, O_CREAT, 0666, 1);
+    gs->score_sem = sem_open(SEM_SCORE, O_CREAT, 0666, 1);
     
-    if (game_state->turn_sem == SEM_FAILED ||
-        game_state->deck_sem == SEM_FAILED ||
-        game_state->score_sem == SEM_FAILED) {
-        perror("[ERROR] sem_open failed");
+    if (gs->turn_sem == SEM_FAILED || 
+        gs->deck_sem == SEM_FAILED || 
+        gs->score_sem == SEM_FAILED) {
+        perror("sem_open");
         cleanup_shared_memory();
         return NULL;
     }
     
-    printf("[SHM] Ready at %p\n", (void*)game_state);
-    return game_state;
+    printf("[SHM] Ready at %p\n", (void*)gs);
+    return gs;
 }
 
-// Clean up shared memory
+// 清理共享内存
 void cleanup_shared_memory() {
-    printf("[SHM] Cleaning up shared memory...\n");
-    
-    // Close and unlink semaphores
     sem_unlink(SEM_TURN);
     sem_unlink(SEM_DECK);
     sem_unlink(SEM_SCORE);
-    
-    // Unlink shared memory object
-    if (shm_unlink(SHM_NAME) == -1) {
-        if (errno != ENOENT) {
-            perror("[WARNING] shm_unlink failed");
-        }
-    }
-    
-    printf("[SHM] Cleanup complete\n");
+    shm_unlink(SHM_NAME);
+    printf("[SHM] Cleanup done\n");
 }
 
-// Print game state (debug)
+// 调试函数
 void print_game_state(GameState *gs) {
-    if (!gs) {
-        printf("[DEBUG] GameState is NULL\n");
-        return;
-    }
+    if (!gs) return;
     
-    printf("\n=== Game State (PID: %d) ===\n", getpid());
-    printf("Turn: Player %d\n", gs->current_turn + 1);
-    printf("Active: %d | Connected: %d\n", 
-           gs->active_count, gs->connected_count);
-    printf("Game active: %s | Game over: %s\n",
-           gs->game_active ? "Yes" : "No",
-           gs->game_over ? "Yes" : "No");
+    printf("\n=== Game State ===\n");
+    printf("Turn: P%d | Active: %d | Connected: %d\n",
+           gs->current_turn + 1, gs->active_count, gs->connected_count);
     
-    if (gs->game_over && gs->winner != -1) {
-        printf("Winner: Player %d\n", gs->winner);
-    }
-    
-    printf("\nPlayers:\n");
     for (int i = 0; i < MAX_PLAYERS; i++) {
         PlayerState *p = &gs->players[i];
-        if (p->connected || p->active) {
-            printf("  P%d: Cards=%d Points=%d Active=%s Stand=%s\n",
+        if (p->connected) {
+            printf("P%d: Cards=%d Points=%d %s\n",
                    p->player_id, p->card_count, p->points,
-                   p->active ? "Y" : "N",
-                   p->standing ? "Y" : "N");
-            
-            if (p->card_count > 0) {
-                printf("      Cards: ");
-                for (int j = 0; j < p->card_count; j++) {
-                    if (p->cards[j] != -1) {
-                        printf("%d ", p->cards[j]);
-                    }
-                }
-                printf("\n");
-            }
+                   p->standing ? "(STAND)" : "");
         }
     }
-    printf("======================\n\n");
+    printf("==================\n");
 }

@@ -1,165 +1,121 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <pthread.h>
 #include <string.h>
-#include <time.h>
-#include <errno.h>
-#include "../include/game_state.h"
-#include "../include/game_logic.h"// Include Member 2's header
+#include "game_state.h"
 
-// Global variables
-volatile sig_atomic_t server_running = 1;
+volatile int running = 1;
 GameState *game_state = NULL;
 
-// Signal handlers
-void handle_sigint() {
-    printf("\n[MAIN] Shutting down...\n");
-    server_running = 0;
+// 信号处理
+void handle_sigint(int sig) {
+    printf("\n[Server] Shutting down...\n");
+    running = 0;
 }
 
-void handle_sigchld() {
+void handle_sigchld(int sig) {
     while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
-// Logger thread function
-void* logger_thread_func(void* arg) {
-    (void)arg;  // Mark parameter as unused
-    printf("[LOGGER] Thread started (TID: %ld)\n", (long)pthread_self());
+// 线程函数（框架）
+void* scheduler_thread(void* arg) {
+    printf("[Scheduler] Started (TID: %ld)\n", pthread_self());
     
-    int heartbeat = 0;
-    while (server_running) {
-        sleep(2);
-        printf("[LOGGER] Heartbeat %d\n", ++heartbeat);
+    while (running) {
+        sleep(1);
+        
+        if (game_state && game_state->game_active) {
+            sem_wait(game_state->turn_sem);
+            printf("[Scheduler] Current turn: Player %d\n", 
+                   game_state->current_turn + 1);
+            // 这里Member 2会实现Round Robin逻辑
+            sem_post(game_state->turn_sem);
+        }
     }
     
-    printf("[LOGGER] Thread exiting\n");
+    printf("[Scheduler] Exiting\n");
     return NULL;
 }
 
-// Client process handler
-void handle_client_process(int player_id) {
-    printf("[CHILD %d] Player %d starting\n", getpid(), player_id);
+void* logger_thread(void* arg) {
+    printf("[Logger] Started (TID: %ld)\n", pthread_self());
     
-    // Mark as connected
+    int count = 0;
+    while (running) {
+        sleep(2);
+        printf("[Logger] Heartbeat %d\n", ++count);
+        // 这里Member 4会实现文件日志
+    }
+    
+    printf("[Logger] Exiting\n");
+    return NULL;
+}
+
+// 客户端子进程
+void client_process(int player_id) {
+    printf("[Child %d] Player %d starting\n", getpid(), player_id);
+    
+    // 标记为已连接
     sem_wait(game_state->turn_sem);
-    game_state->players[player_id - 1].connected = true;
-    game_state->players[player_id - 1].active = true;
+    game_state->players[player_id-1].connected = true;
+    game_state->players[player_id-1].active = true;
     game_state->connected_count++;
     sem_post(game_state->turn_sem);
     
-    printf("[CHILD %d] Connected. Total: %d/3 needed\n", 
+    printf("[Child %d] Connected. Total: %d/3 needed\n", 
            getpid(), game_state->connected_count);
     
-    // Wait for minimum players
-    while (game_state->connected_count < 3 && server_running) {
+    // 等待最少3个玩家
+    while (game_state->connected_count < 3 && running) {
         sleep(1);
     }
     
-    // Start game when enough players
-    if (server_running && game_state->connected_count >= 3) {
-        // Only first player initializes game
-        if (player_id == 1) {
-            printf("[CHILD %d] Starting game...\n", getpid());
-            init_game_round(game_state);
-        } else {
-            printf("[CHILD %d] Waiting for game start...\n", getpid());
-        }
-        
-        // Wait for game to be active
-        while (!game_state->game_active && server_running) {
-            sleep(1);
+    if (running) {
+        printf("[Child %d] Game starting!\n", getpid());
+        // 游戏逻辑将由Member 2实现
+        for (int i = 0; i < 3 && running; i++) {
+            sleep(2);
+            printf("[Child %d] Round %d\n", getpid(), i+1);
         }
     }
     
-    // Game loop
-    int round = 1;
-    while (server_running && game_state->game_active) {
-        printf("[CHILD %d] Player %d round %d\n", getpid(), player_id, round);
-        
-        // Check if it's this player's turn
-        sem_wait(game_state->turn_sem);
-        if (game_state->current_turn == player_id - 1) {
-            PlayerState *player = &game_state->players[player_id - 1];
-            
-            if (!player->standing && player->points <= 21) {
-                printf("[CHILD %d] Player %d's turn! Points: %d\n",
-                       getpid(), player_id, player->points);
-                
-                // Simple AI decision
-                if (player->points < 16) {
-                    printf("[CHILD %d] Player %d HIT\n", getpid(), player_id);
-                    player_hit(game_state, player_id);
-                } else {
-                    printf("[CHILD %d] Player %d STAND\n", getpid(), player_id);
-                    player_stand(game_state, player_id);
-                }
-            }
-        }
-        sem_post(game_state->turn_sem);
-        
-        round++;
-        
-        // Check if game ended
-        if (!game_state->game_active) {
-            printf("[CHILD %d] Game ended\n", getpid());
-            break;
-        }
-        
-        sleep(2);
-    }
-    
-    // Clean exit
+    // 清理退出
     sem_wait(game_state->turn_sem);
-    game_state->players[player_id - 1].connected = false;
-    game_state->players[player_id - 1].active = false;
+    game_state->players[player_id-1].connected = false;
     game_state->connected_count--;
     sem_post(game_state->turn_sem);
     
-    printf("[CHILD %d] Exiting\n", getpid());
+    printf("[Child %d] Exiting\n", getpid());
     exit(0);
 }
 
 int main() {
-    printf("=== Blackjack Server ===\n");
+    printf("=== Blackjack Server (MiniOS) ===\n");
     printf("PID: %d\n", getpid());
     
-    // Setup signals
-    signal(SIGINT, (void (*)(int))handle_sigint);
-    signal(SIGCHLD, (void (*)(int))handle_sigchld);
+    // 信号处理
+    signal(SIGINT, handle_sigint);
+    signal(SIGCHLD, handle_sigchld);
     
-    // Initialize shared memory
+    // 初始化共享内存
     game_state = init_shared_memory();
     if (!game_state) {
         fprintf(stderr, "Failed to init shared memory\n");
         return 1;
     }
     
-    // Create threads
-    pthread_t scheduler_thread, logger_thread;
+    // 创建内部线程
+    pthread_t sched_tid, log_tid;
+    pthread_create(&sched_tid, NULL, scheduler_thread, NULL);
+    pthread_create(&log_tid, NULL, logger_thread, NULL);
     
-    // Create scheduler thread (Member 2's function)
-    if (pthread_create(&scheduler_thread, NULL, scheduler_thread_func, (void*)game_state) != 0) {
-        perror("Failed to create scheduler thread");
-        cleanup_shared_memory();
-        return 1;
-    }
+    printf("[Main] Threads created. Waiting for players...\n");
     
-    // Create logger thread
-    if (pthread_create(&logger_thread, NULL, logger_thread_func, NULL) != 0) {
-        perror("Failed to create logger thread");
-        cleanup_shared_memory();
-        return 1;
-    }
-    
-    printf("[MAIN] Threads created. Waiting for players...\n");
-    printf("[MAIN] Need 3 players to start game\n");
-    
-    // Fork player processes
-    for (int i = 1; i <= 3 && server_running; i++) {
+    // Fork子进程处理玩家（模拟3个玩家）
+    for (int i = 1; i <= 3 && running; i++) {
         pid_t pid = fork();
         
         if (pid < 0) {
@@ -168,37 +124,27 @@ int main() {
         }
         
         if (pid == 0) {
-            // Child process
-            handle_client_process(i);
+            // 子进程
+            client_process(i);
         } else {
-            // Parent process
-            printf("[MAIN] Forked player %d (PID: %d)\n", i, pid);
+            printf("[Main] Forked player %d (PID: %d)\n", i, pid);
         }
         
-        sleep(1);  // Delay between forks
+        sleep(1); // 间隔启动
     }
     
-    // Main loop
-    while (server_running) {
+    // 主循环
+    while (running) {
         sleep(1);
-        
-        // Print game state periodically
-        static int print_counter = 0;
-        if (++print_counter % 5 == 0) {
-            print_game_state(game_state);
-        }
+        print_game_state(game_state);
     }
     
-    // Cleanup
-    printf("\n[MAIN] Cleaning up...\n");
-    
-    // Wait for threads to finish
-    pthread_join(scheduler_thread, NULL);
-    pthread_join(logger_thread, NULL);
-    
-    // Cleanup shared memory
+    // 清理
+    printf("[Main] Cleaning up...\n");
+    pthread_join(sched_tid, NULL);
+    pthread_join(log_tid, NULL);
     cleanup_shared_memory();
     
-    printf("[MAIN] Server stopped\n");
+    printf("[Main] Server stopped\n");
     return 0;
 }
