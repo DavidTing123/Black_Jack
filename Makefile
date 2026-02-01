@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -pthread -Wall -I./include
 LDFLAGS = -lrt -pthread
 TARGET = server
-SRCS = src/server.c src/shared_mem.c
+SRCS = src/server.c src/shared_mem.c src/game_logic.c
 OBJS = $(SRCS:.c=.o)
 
 all: $(TARGET)
