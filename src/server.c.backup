@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "game_logic.h"
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -8,8 +9,9 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
-#include "../include/game_state.h"
-#include "../include/game_logic.h"// Include Member 2's header
+#include "game_state.h"
+
+// Declare Member 2's functions
 
 // Global variables
 volatile sig_atomic_t server_running = 1;

@@ -1,67 +1,126 @@
-#include "game_state.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include "../include/game_state.h"
 
+// ==================== Helper Functions ====================
+bool can_player_act(const PlayerState *player) {
+    return (player != NULL && 
+            player->active && 
+            player->connected && 
+            !player->standing &&
+            player->points <= 21);
+}
+
+int find_next_player(GameState *gs, int current_index) {
+    if (!gs) return -1;
+    
+    int checked = 0;
+    int next_index = (current_index + 1) % MAX_PLAYERS;
+    
+    while (checked < MAX_PLAYERS) {
+        if (can_player_act(&gs->players[next_index])) {
+            return next_index;
+        }
+        
+        next_index = (next_index + 1) % MAX_PLAYERS;
+        checked++;
+    }
+    
+    return -1;  // No player can act
+}
+
+bool is_game_complete(GameState *gs) {
+    if (!gs) return true;
+    
+    int active_can_act = 0;
+    
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (gs->players[i].active && can_player_act(&gs->players[i])) {
+            active_can_act++;
+        }
+    }
+    
+    return (active_can_act == 0);
+}
+
+// ==================== Scheduler Thread ====================
 void* scheduler_thread_func(void* arg) {
     GameState *gs = (GameState*)arg;
     
+    if (!gs) {
+        fprintf(stderr, "[SCHEDULER] Invalid game state\n");
+        return NULL;
+    }
+    
+    printf("[SCHEDULER] Thread started (TID: %ld)\n", (long)pthread_self());
+    
     while (1) {
-        // 等待游戏开始
+        // Wait for game to start
         if (!gs->game_active) {
             sleep(1);
             continue;
         }
         
-        // 保护当前回合的访问
         sem_wait(gs->turn_sem);
+        
+        // Check if game should end
+        if (is_game_complete(gs)) {
+            printf("[SCHEDULER] Game complete\n");
+            gs->game_active = false;
+            sem_post(gs->turn_sem);
+            
+            // Determine winner
+            int winner = -1;
+            int best_score = -1;
+            
+            sem_wait(gs->turn_sem);
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                if (gs->players[i].active && gs->players[i].points <= 21) {
+                    if (gs->players[i].points > best_score) {
+                        best_score = gs->players[i].points;
+                        winner = gs->players[i].player_id;
+                    } else if (gs->players[i].points == best_score) {
+                        winner = -1;  // Tie
+                    }
+                }
+            }
+            sem_post(gs->turn_sem);
+            
+            if (winner > 0) {
+                printf("[SCHEDULER] Winner: Player %d (%d points)\n", winner, best_score);
+            }
+            
+            sleep(2);
+            continue;
+        }
         
         int current = gs->current_turn;
         PlayerState *current_player = &gs->players[current];
         
-        // 检查当前玩家是否可以行动
-        if (current_player->active && !current_player->standing) {
-            printf("[SCHEDULER] Player %d's turn\n", current_player->player_id);
-            // 这里可以通知客户端或设置标志
+        // Announce turn
+        if (can_player_act(current_player)) {
+            printf("[SCHEDULER] Turn: Player %d (Points: %d)\n",
+                   current_player->player_id,
+                   current_player->points);
             
-            // 给玩家时间行动（比如10秒）
-            // 超时处理可以由Member 3实现
+            // Simulate waiting for player action
+            printf("[SCHEDULER] Waiting for Player %d...\n",
+                   current_player->player_id);
         }
         
-        // 寻找下一个活跃且未停牌的玩家
-        int next_turn = (current + 1) % MAX_PLAYERS;
-        int checked = 0;
+        // Find next player
+        int next_player = find_next_player(gs, current);
         
-        while (checked < MAX_PLAYERS) {
-            PlayerState *next = &gs->players[next_turn];
-            
-            if (next->active && !next->standing) {
-                // 找到下一个可行动的玩家
-                break;
-            }
-            
-            next_turn = (next_turn + 1) % MAX_PLAYERS;
-            checked++;
-        }
-        
-        // 更新回合
-        gs->current_turn = next_turn;
-        
-        // 检查是否所有玩家都停牌（游戏结束）
-        int standing_count = 0;
-        for (int i = 0; i < MAX_PLAYERS; i++) {
-            if (gs->players[i].active && gs->players[i].standing) {
-                standing_count++;
-            }
-        }
-        
-        if (standing_count == gs->active_players && gs->active_players > 0) {
-            // 所有活跃玩家都停牌，游戏结束
-            gs->game_active = false;
-            // 触发胜负判定
+        if (next_player >= 0) {
+            gs->current_turn = next_player;
+            printf("[SCHEDULER] Next: Player %d\n", next_player + 1);
         }
         
         sem_post(gs->turn_sem);
         
-        // 等待一段时间再检查（模拟回合间隔）
+        // Wait between turns
         sleep(2);
     }
     

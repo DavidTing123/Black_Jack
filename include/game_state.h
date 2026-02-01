@@ -5,18 +5,18 @@
 #include <stdbool.h>
 #include <time.h>
 
-// 游戏常量
+// Game constants
 #define MAX_PLAYERS 5
 #define MAX_CARDS 10
 #define DECK_SIZE 52
 
-// IPC名称（MiniOS中可能需要调整）
-#define SHM_NAME "/bj_shm"
-#define SEM_TURN "/bj_turn"
-#define SEM_DECK "/bj_deck"
-#define SEM_SCORE "/bj_score"
+// IPC names (for MiniOS)
+#define SHM_NAME "/blackjack_shm"
+#define SEM_TURN "/blackjack_turn_sem"
+#define SEM_DECK "/blackjack_deck_sem"
+#define SEM_SCORE "/blackjack_score_sem"
 
-// 玩家状态
+// Player state
 typedef struct {
     int player_id;
     int cards[MAX_CARDS];
@@ -28,23 +28,30 @@ typedef struct {
     time_t last_active;
 } PlayerState;
 
-// 游戏全局状态（共享内存结构）
+// Global game state (shared memory structure)
 typedef struct {
+    // Players
     PlayerState players[MAX_PLAYERS];
     int current_turn;
     int active_count;
     int connected_count;
+    
+    // Game status
     bool game_active;
     bool game_over;
     int winner;
+    
+    // Deck
     int deck[DECK_SIZE];
     int deck_idx;
+    
+    // Synchronization (process-shared)
     sem_t *turn_sem;
     sem_t *deck_sem;
     sem_t *score_sem;
 } GameState;
 
-// 函数声明
+// Shared memory functions
 GameState* init_shared_memory();
 void cleanup_shared_memory();
 void print_game_state(GameState *gs);
