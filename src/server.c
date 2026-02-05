@@ -9,16 +9,18 @@
 #include <signal.h>
 #include <wait.h>
 #include <semaphore.h>
+#include <pthread.h> // Added for scheduler
 
 #include "../include/game_state.h"
 #include "../include/network.h"
+#include "../include/game_logic.h" // Added game logic
 
 // External references
-extern void init_game_state_struct(GameState *gs);
-extern const char* get_card_name(int val);
+extern void* scheduler_thread_func(void* arg); // From scheduler.c
 
 GameState *gs = NULL;
 int server_sock = -1;
+pthread_t sched_tid;
 
 void handle_signal(int sig) {
     printf("\nShutting down server...\n");
@@ -63,52 +65,72 @@ void handle_client(int client_sock, int player_id) {
     gs->players[player_id].active = true;
     gs->players[player_id].standing = false;
     gs->active_count++;
+    
+    // Check if we can start game (e.g. 3 players)
+    if (gs->active_count >= 3 && !gs->game_active) {
+         printf("[SERVER] 3 players connected. Starting game!\n");
+         // Only one process should trigger this. 
+         // Since we are inside semaphore, it's safe to check/set but init_game_round is unsafe 
+         // if another process is also checking. But 'active_count' increment is protected.
+         // However, init_game_round modifies Deck which needs deck_sem protection ideally, 
+         // OR we assume init happens before main loop logic.
+         // Let's rely on init_game_round protecting itself or being called here.
+         // We should release score_sem before heavy logic? No, to avoid races on start.
+         // But init_game_round uses rand() etc.
+         // Let's do it here.
+         init_game_round(gs);
+    }
     sem_post(gs->score_sem);
 
     char buffer[BUFFER_SIZE];
     snprintf(buffer, sizeof(buffer), "Connected to server 127.0.0.1:8888\nWelcome! Player %d\n", player_id);
     send(client_sock, buffer, strlen(buffer), 0);
-    // Prevent TCP bundling with the first game state message
     usleep(100000);
 
-    // Initial Deal (2 cards)
-    sem_wait(gs->deck_sem);
-    int c1 = gs->deck[gs->deck_idx++];
-    int c2 = gs->deck[gs->deck_idx++];
-    sem_post(gs->deck_sem);
-
-    gs->players[player_id].cards[0] = c1;
-    gs->players[player_id].cards[1] = c2;
-    gs->players[player_id].card_count = 2;
-    // Calculate points
-    extern int calculate_points(const int *cards, int count);
-    gs->players[player_id].points = calculate_points(gs->players[player_id].cards, 2);
-
+    // Main Game Loop for Client
     int last_known_turn = -1;
+    bool sent_game_over = false;
 
     while (1) {
         // CHECK FOR GAME OVER
         bool game_over = false;
-        sem_wait(gs->turn_sem);
-        if (gs->game_over) game_over = true;
+        int winner = -1;
+        
+        sem_wait(gs->turn_sem); // Protect read of game state
+        if (gs->game_over) {
+            game_over = true;
+            winner = gs->winner;
+        }
         sem_post(gs->turn_sem);
 
         if (game_over) {
-            char winner_msg[128];
-            int winner = gs->winner;
-            
-            if (winner == -1) {
-                 snprintf(winner_msg, sizeof(winner_msg), "No Winner (Everyone Busted!)\nPlayer %d finished with %d points.", player_id, gs->players[player_id].points);
-            } else {
-                int winner_pts = gs->players[winner].points;
-                snprintf(winner_msg, sizeof(winner_msg), "Winner is Player %d with %d points\nPlayer %d finished with %d points.", 
-                     winner, winner_pts, player_id, gs->players[player_id].points);
+            if (!sent_game_over) {
+                 char winner_msg[128];
+                 
+                 if (winner == -1) {
+                      snprintf(winner_msg, sizeof(winner_msg), "No Winner (Everyone Busted!)\nPlayer %d finished with %d points.", player_id, gs->players[player_id].points);
+                 } else {
+                     int winner_pts = gs->players[winner].points;
+                     snprintf(winner_msg, sizeof(winner_msg), "Winner is Player %d with %d points\nPlayer %d finished with %d points.", 
+                          winner, winner_pts, player_id, gs->players[player_id].points);
+                 }
+                 
+                 char final_buf[256];
+                 snprintf(final_buf, sizeof(final_buf), "STATE: Game Over\nMESSAGE: %s", winner_msg);
+                 send(client_sock, final_buf, strlen(final_buf), 0);
+                 sent_game_over = true;
             }
-            
-            char final_buf[256];
-            snprintf(final_buf, sizeof(final_buf), "STATE: Game Over\nMESSAGE: %s", winner_msg);
-            send(client_sock, final_buf, strlen(final_buf), 0);
-            break;
+            // Wait for reset or disconnect
+             usleep(500000); 
+             // If game restarts?
+             if (!gs->game_over) sent_game_over = false; // logic to support restart
+             continue; // Keep connection open or break? Prompt implies game ends.
+        }
+
+        if (!gs->game_active) {
+            // Waiting for players
+             usleep(500000);
+             continue;
         }
 
         // TURN CHECK
@@ -117,7 +139,7 @@ void handle_client(int client_sock, int player_id) {
 
         sem_wait(gs->turn_sem);
         current_turn_val = gs->current_turn;
-        if (current_turn_val == player_id) {
+        if (current_turn_val == player_id && !gs->players[player_id].standing && gs->players[player_id].points <= 21) {
             my_turn = true;
         }
         sem_post(gs->turn_sem);
@@ -126,69 +148,16 @@ void handle_client(int client_sock, int player_id) {
             if (current_turn_val != last_known_turn) {
                 // New turn detected, send status update
                 char wait_msg[64];
-                snprintf(wait_msg, sizeof(wait_msg), "Not Player %d's turn. Waiting...", player_id);
+                snprintf(wait_msg, sizeof(wait_msg), "Player %d's Turn. Waiting...", current_turn_val);
                 send_game_state(client_sock, player_id, wait_msg);
                 last_known_turn = current_turn_val;
             }
-            usleep(200000); // 200ms
+            usleep(200000); // 200ms poll
             continue;
         }
 
         // IT IS MY TURN
-        // Check if we are already done (bust/stand) but turn came back to us?
-        // If the turn passing logic is correct, this shouldn't happen unless everyone is done?
-        // But for safety, check status.
-        int points = gs->players[player_id].points;
-        if (gs->players[player_id].standing || points > 21) {
-             // We should not have the turn if we are done. Pass it.
-             sem_wait(gs->turn_sem);
-             
-             // Check if Game Over condition (everyone done)
-             // Simple scan
-             bool anyone_left = false;
-             for(int i=0; i<MAX_PLAYERS; i++) {
-                 PlayerState *p = &gs->players[i];
-                 if (p->active && p->connected && !p->standing && p->points <= 21) {
-                     anyone_left = true;
-                     break;
-                 }
-             }
-
-             if (!anyone_left) {
-                 gs->game_over = true;
-                 // Determine winner
-                 int max_pts = 0;
-                 int best_player = -1;
-                 for(int i=0; i<MAX_PLAYERS; i++) {
-                     PlayerState *p = &gs->players[i];
-                     if (p->active && p->points <= 21) {
-                         if (p->points > max_pts) {
-                             max_pts = p->points;
-                             best_player = i;
-                         }
-                     }
-                 }
-                 gs->winner = best_player;
-                 if (best_player != -1)
-                    printf("GAME OVER: Winner is Player %d with %d points.\n", best_player, max_pts);
-                 else
-                    printf("GAME OVER: No Winner (Everyone Busted).\n");
-             } else {
-                 // Pass to next eligible
-                 int loops = 0;
-                 do {
-                    gs->current_turn = (gs->current_turn + 1) % MAX_PLAYERS;
-                    PlayerState *p = &gs->players[gs->current_turn];
-                    if (p->active && p->connected && !p->standing && p->points <= 21) {
-                        break;
-                    }
-                    loops++;
-                 } while (loops < MAX_PLAYERS);
-             }
-             sem_post(gs->turn_sem);
-             continue; // Loop back to see game over msg
-        }
-
+        
         // Notify User it IS their turn
         char turn_msg[64];
         snprintf(turn_msg, sizeof(turn_msg), "Player %d's turn! hit or stand?", player_id);
@@ -198,67 +167,38 @@ void handle_client(int client_sock, int player_id) {
         int bytes = recv(client_sock, buffer, sizeof(buffer)-1, 0);
         if (bytes <= 0) break; // disconnected
         buffer[bytes] = 0;
+        buffer[strcspn(buffer, "\r\n")] = 0; // Clean newline
 
-        // Clean newline
-        buffer[strcspn(buffer, "\r\n")] = 0;
-
+        // Process Action
         if (strcmp(buffer, "hit") == 0) {
-            printf("[SERVER Player %d] Processing hit...\n", player_id);
             sem_wait(gs->deck_sem);
-            extern int draw_card(GameState*);
-            int new_card = draw_card(gs);
+            player_hit(gs, player_id);
             sem_post(gs->deck_sem);
-            printf("[SERVER Player %d] Drew card: %d\n", player_id, new_card);
-
-            gs->players[player_id].cards[gs->players[player_id].card_count++] = new_card;
-            gs->players[player_id].points = calculate_points(gs->players[player_id].cards, gs->players[player_id].card_count);
-            printf("[SERVER Player %d] New points: %d (card_count: %d)\n", player_id, gs->players[player_id].points, gs->players[player_id].card_count);
-            
         } else if (strcmp(buffer, "stand") == 0) {
-            printf("[SERVER Player %d] Processing stand...\n", player_id);
-            gs->players[player_id].standing = true;
+            sem_wait(gs->turn_sem); // Protecting state change
+            player_stand(gs, player_id);
+            sem_post(gs->turn_sem);
         }
 
-        // Pass turn logic
-        printf("[SERVER Player %d] Passing turn...\n", player_id);
-        sem_wait(gs->turn_sem);
+        // We don't manually pass turn here. The scheduler thread will see we are standing/busted or that we took an action?
+        // Actually, if we hit, we might still be active. Round Robin usually implies 1 move per turn or "Hit until Stand"?
+        // Prompt says: "Manage player turn order (0->1->2->0...)".
+        // In Blackjack, typically you play until you stand/bust.
+        // If we want "One card per turn" round robin, we would pass turn after hit.
+        // If we want "Play until done", we keep turn.
+        // Spec 2.4: "Manage player turn order... Skip inactive...".
+        // If the scheduler is running, and we just hit and are still <= 21, do we keep turn?
+        // The scheduler loop just checks "current". It doesn't auto-rotate unless we are invalid?
+        // Wait, my scheduler code rotates if "need_pass_turn" (inactive/standing/busted). 
+        // If I am active and <= 21, scheduler does NOT rotate.
+        // So I will stay in my turn loop! 
+        // This effectively implements "Play until done" (standard Blackjack). 
+        // BUT, if I want to yield turn after HITTING (like some variants or to let others see?), no, standard is play till stand.
+        // So I will loop back.
         
-        if (gs->players[player_id].points > 21) {
-             gs->players[player_id].standing = true; 
-        }
-        
-        int prev_turn = gs->current_turn;
-        int loops = 0;
-        do {
-            gs->current_turn = (gs->current_turn + 1) % MAX_PLAYERS;
-            PlayerState *p = &gs->players[gs->current_turn];
-            if (p->active && p->connected && !p->standing && p->points <= 21) {
-                break;
-            }
-            loops++;
-        } while (loops < MAX_PLAYERS);
-        
-        printf("[SERVER Player %d] Turn passed from %d to %d (loops: %d)\n", player_id, prev_turn, gs->current_turn, loops);
-
-        if (loops >= MAX_PLAYERS) {
-             printf("[SERVER] Detected GAME OVER (no eligible players left)\n");
-             gs->game_over = true;
-             int max_pts = 0;
-             int best_player = -1;
-             for(int i=0; i<MAX_PLAYERS; i++) {
-                 PlayerState *p = &gs->players[i];
-                 if (p->active && p->points <= 21) {
-                     if (p->points > max_pts) {
-                         max_pts = p->points;
-                         best_player = i;
-                     }
-                 }
-             }
-             gs->winner = best_player;
-        }
-
-        sem_post(gs->turn_sem);
-        printf("[SERVER Player %d] Turn pass complete. Re-entering loop.\n", player_id);
+        // However, if I busted, `player_hit` called `player_stand` or I should set myself as having finished turn?
+        // `player_hit` checks bust and calls `player_stand`.
+        // So scheduler will see Busted/Standing and rotate. Perfect.
     }
 
     // Cleanup
@@ -281,10 +221,16 @@ int main() {
         exit(1);
     }
     
-    // Initialize Game Logic (shuffle deck, etc)
+    // Initialize basic struct pointers/vals
     init_game_state_struct(gs);
 
-    // 2. Setup Network
+    // 2. Start Scheduler Thread
+    if (pthread_create(&sched_tid, NULL, scheduler_thread_func, (void*)gs) != 0) {
+        perror("Failed to create scheduler thread");
+        handle_signal(0);
+    }
+
+    // 3. Setup Network
     server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) {
         perror("Socket failed");
@@ -309,8 +255,9 @@ int main() {
     }
 
     printf("Blackjack Server running on port 8888...\n");
+    printf("Waiting for 3 players to start game...\n");
 
-    // 3. Accept Loop
+    // 4. Accept Loop
     int client_idx = 0;
     while (1) {
         struct sockaddr_in client_addr;
@@ -321,20 +268,23 @@ int main() {
             continue;
         }
 
-        printf("New connection: Player %d\n", client_idx);
+        // Find a free slot if client_idx is taken? 
+        // Simple round robin assignment for now as per Member 1 code
+        // But better to find first inactive slot?
+        // Preserving Member 1 logic: client_idx = (client_idx + 1) % MAX;
+        
+        printf("New connection assigned to Player %d\n", client_idx);
         
         pid_t pid = fork();
         if (pid == 0) {
             // Child
-            close(server_sock); // Child doesn't listen
+            close(server_sock); 
             handle_client(new_socket, client_idx);
             exit(0);
         } else if (pid > 0) {
             // Parent
-            close(new_socket); // Parent doesn't handle client
+            close(new_socket); 
             client_idx = (client_idx + 1) % MAX_PLAYERS;
-            // Wait for zombies? 
-            // signal(SIGCHLD, SIG_IGN) is easiest way to avoid zombies
             signal(SIGCHLD, SIG_IGN);
         } else {
             perror("Fork failed");
