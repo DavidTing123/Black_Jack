@@ -1,150 +1,345 @@
+// src/server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <string.h>
-#include "game_state.h"
+#include <signal.h>
+#include <wait.h>
+#include <semaphore.h>
 
-volatile int running = 1;
-GameState *game_state = NULL;
+#include "../include/game_state.h"
+#include "../include/network.h"
 
-// 信号处理
-void handle_sigint(int sig) {
-    printf("\n[Server] Shutting down...\n");
-    running = 0;
+// External references
+extern void init_game_state_struct(GameState *gs);
+extern const char* get_card_name(int val);
+
+GameState *gs = NULL;
+int server_sock = -1;
+
+void handle_signal(int sig) {
+    printf("\nShutting down server...\n");
+    if (gs) cleanup_shared_memory(gs);
+    if (server_sock != -1) close(server_sock);
+    exit(0);
 }
 
-void handle_sigchld(int sig) {
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-}
-
-// 线程函数（框架）
-void* scheduler_thread(void* arg) {
-    printf("[Scheduler] Started (TID: %ld)\n", pthread_self());
+// Helper to format and send game state
+void send_game_state(int client_sock, int player_id, const char *msg_text) {
+    char state_buf[256];
+    char cards_str[64] = "";
     
-    while (running) {
-        sleep(1);
+    // Build cards string manually to be safe
+    for (int i = 0; i < gs->players[player_id].card_count; i++) {
+        const char *n = get_card_name(gs->players[player_id].cards[i]);
+        strcat(cards_str, n);
+        if (i < gs->players[player_id].card_count - 1) {
+            strcat(cards_str, ",");
+        }
+    }
+
+    snprintf(state_buf, sizeof(state_buf), 
+        "STATE: turn=%d player_id=%d cards=%s points=%d standing=%s\n"
+        "MESSAGE: %s",
+        gs->current_turn,
+        player_id,
+        cards_str,
+        gs->players[player_id].points,
+        gs->players[player_id].standing ? "true" : "false",
+        msg_text
+    );
+    send(client_sock, state_buf, strlen(state_buf), 0);
+}
+
+void handle_client(int client_sock, int player_id) {
+    printf("Player %d handler started (PID %d)\n", player_id, getpid());
+
+    // 1. Initial State
+    sem_wait(gs->score_sem);
+    gs->players[player_id].connected = true;
+    gs->players[player_id].active = true;
+    gs->players[player_id].standing = false;
+    gs->active_count++;
+    sem_post(gs->score_sem);
+
+    char buffer[BUFFER_SIZE];
+    snprintf(buffer, sizeof(buffer), "Connected to server 127.0.0.1:8888\nWelcome! Player %d\n", player_id);
+    send(client_sock, buffer, strlen(buffer), 0);
+    // Prevent TCP bundling with the first game state message
+    usleep(100000);
+
+    // Initial Deal (2 cards)
+    sem_wait(gs->deck_sem);
+    int c1 = gs->deck[gs->deck_idx++];
+    int c2 = gs->deck[gs->deck_idx++];
+    sem_post(gs->deck_sem);
+
+    gs->players[player_id].cards[0] = c1;
+    gs->players[player_id].cards[1] = c2;
+    gs->players[player_id].card_count = 2;
+    // Calculate points
+    extern int calculate_points(const int *cards, int count);
+    gs->players[player_id].points = calculate_points(gs->players[player_id].cards, 2);
+
+    int last_known_turn = -1;
+
+    while (1) {
+        // CHECK FOR GAME OVER
+        bool game_over = false;
+        sem_wait(gs->turn_sem);
+        if (gs->game_over) game_over = true;
+        sem_post(gs->turn_sem);
+
+        if (game_over) {
+            char winner_msg[128];
+            int winner = gs->winner;
+            
+            if (winner == -1) {
+                 snprintf(winner_msg, sizeof(winner_msg), "No Winner (Everyone Busted!)\nPlayer %d finished with %d points.", player_id, gs->players[player_id].points);
+            } else {
+                int winner_pts = gs->players[winner].points;
+                snprintf(winner_msg, sizeof(winner_msg), "Winner is Player %d with %d points\nPlayer %d finished with %d points.", 
+                     winner, winner_pts, player_id, gs->players[player_id].points);
+            }
+            
+            char final_buf[256];
+            snprintf(final_buf, sizeof(final_buf), "STATE: Game Over\nMESSAGE: %s", winner_msg);
+            send(client_sock, final_buf, strlen(final_buf), 0);
+            break;
+        }
+
+        // TURN CHECK
+        bool my_turn = false;
+        int current_turn_val = -1;
+
+        sem_wait(gs->turn_sem);
+        current_turn_val = gs->current_turn;
+        if (current_turn_val == player_id) {
+            my_turn = true;
+        }
+        sem_post(gs->turn_sem);
+
+        if (!my_turn) {
+            if (current_turn_val != last_known_turn) {
+                // New turn detected, send status update
+                char wait_msg[64];
+                snprintf(wait_msg, sizeof(wait_msg), "Not Player %d's turn. Waiting...", player_id);
+                send_game_state(client_sock, player_id, wait_msg);
+                last_known_turn = current_turn_val;
+            }
+            usleep(200000); // 200ms
+            continue;
+        }
+
+        // IT IS MY TURN
+        // Check if we are already done (bust/stand) but turn came back to us?
+        // If the turn passing logic is correct, this shouldn't happen unless everyone is done?
+        // But for safety, check status.
+        int points = gs->players[player_id].points;
+        if (gs->players[player_id].standing || points > 21) {
+             // We should not have the turn if we are done. Pass it.
+             sem_wait(gs->turn_sem);
+             
+             // Check if Game Over condition (everyone done)
+             // Simple scan
+             bool anyone_left = false;
+             for(int i=0; i<MAX_PLAYERS; i++) {
+                 PlayerState *p = &gs->players[i];
+                 if (p->active && p->connected && !p->standing && p->points <= 21) {
+                     anyone_left = true;
+                     break;
+                 }
+             }
+
+             if (!anyone_left) {
+                 gs->game_over = true;
+                 // Determine winner
+                 int max_pts = 0;
+                 int best_player = -1;
+                 for(int i=0; i<MAX_PLAYERS; i++) {
+                     PlayerState *p = &gs->players[i];
+                     if (p->active && p->points <= 21) {
+                         if (p->points > max_pts) {
+                             max_pts = p->points;
+                             best_player = i;
+                         }
+                     }
+                 }
+                 gs->winner = best_player;
+                 if (best_player != -1)
+                    printf("GAME OVER: Winner is Player %d with %d points.\n", best_player, max_pts);
+                 else
+                    printf("GAME OVER: No Winner (Everyone Busted).\n");
+             } else {
+                 // Pass to next eligible
+                 int loops = 0;
+                 do {
+                    gs->current_turn = (gs->current_turn + 1) % MAX_PLAYERS;
+                    PlayerState *p = &gs->players[gs->current_turn];
+                    if (p->active && p->connected && !p->standing && p->points <= 21) {
+                        break;
+                    }
+                    loops++;
+                 } while (loops < MAX_PLAYERS);
+             }
+             sem_post(gs->turn_sem);
+             continue; // Loop back to see game over msg
+        }
+
+        // Notify User it IS their turn
+        char turn_msg[64];
+        snprintf(turn_msg, sizeof(turn_msg), "Player %d's turn! hit or stand?", player_id);
+        send_game_state(client_sock, player_id, turn_msg);
         
-        if (game_state && game_state->game_active) {
-            sem_wait(game_state->turn_sem);
-            printf("[Scheduler] Current turn: Player %d\n", 
-                   game_state->current_turn + 1);
-            // 这里Member 2会实现Round Robin逻辑
-            sem_post(game_state->turn_sem);
-        }
-    }
-    
-    printf("[Scheduler] Exiting\n");
-    return NULL;
-}
+        // Wait for input
+        int bytes = recv(client_sock, buffer, sizeof(buffer)-1, 0);
+        if (bytes <= 0) break; // disconnected
+        buffer[bytes] = 0;
 
-void* logger_thread(void* arg) {
-    printf("[Logger] Started (TID: %ld)\n", pthread_self());
-    
-    int count = 0;
-    while (running) {
-        sleep(2);
-        printf("[Logger] Heartbeat %d\n", ++count);
-        // 这里Member 4会实现文件日志
-    }
-    
-    printf("[Logger] Exiting\n");
-    return NULL;
-}
+        // Clean newline
+        buffer[strcspn(buffer, "\r\n")] = 0;
 
-// 客户端子进程
-void client_process(int player_id) {
-    printf("[Child %d] Player %d starting\n", getpid(), player_id);
-    
-    // 标记为已连接
-    sem_wait(game_state->turn_sem);
-    game_state->players[player_id-1].connected = true;
-    game_state->players[player_id-1].active = true;
-    game_state->connected_count++;
-    sem_post(game_state->turn_sem);
-    
-    printf("[Child %d] Connected. Total: %d/3 needed\n", 
-           getpid(), game_state->connected_count);
-    
-    // 等待最少3个玩家
-    while (game_state->connected_count < 3 && running) {
-        sleep(1);
-    }
-    
-    if (running) {
-        printf("[Child %d] Game starting!\n", getpid());
-        // 游戏逻辑将由Member 2实现
-        for (int i = 0; i < 3 && running; i++) {
-            sleep(2);
-            printf("[Child %d] Round %d\n", getpid(), i+1);
+        if (strcmp(buffer, "hit") == 0) {
+            printf("[SERVER Player %d] Processing hit...\n", player_id);
+            sem_wait(gs->deck_sem);
+            extern int draw_card(GameState*);
+            int new_card = draw_card(gs);
+            sem_post(gs->deck_sem);
+            printf("[SERVER Player %d] Drew card: %d\n", player_id, new_card);
+
+            gs->players[player_id].cards[gs->players[player_id].card_count++] = new_card;
+            gs->players[player_id].points = calculate_points(gs->players[player_id].cards, gs->players[player_id].card_count);
+            printf("[SERVER Player %d] New points: %d (card_count: %d)\n", player_id, gs->players[player_id].points, gs->players[player_id].card_count);
+            
+        } else if (strcmp(buffer, "stand") == 0) {
+            printf("[SERVER Player %d] Processing stand...\n", player_id);
+            gs->players[player_id].standing = true;
         }
+
+        // Pass turn logic
+        printf("[SERVER Player %d] Passing turn...\n", player_id);
+        sem_wait(gs->turn_sem);
+        
+        if (gs->players[player_id].points > 21) {
+             gs->players[player_id].standing = true; 
+        }
+        
+        int prev_turn = gs->current_turn;
+        int loops = 0;
+        do {
+            gs->current_turn = (gs->current_turn + 1) % MAX_PLAYERS;
+            PlayerState *p = &gs->players[gs->current_turn];
+            if (p->active && p->connected && !p->standing && p->points <= 21) {
+                break;
+            }
+            loops++;
+        } while (loops < MAX_PLAYERS);
+        
+        printf("[SERVER Player %d] Turn passed from %d to %d (loops: %d)\n", player_id, prev_turn, gs->current_turn, loops);
+
+        if (loops >= MAX_PLAYERS) {
+             printf("[SERVER] Detected GAME OVER (no eligible players left)\n");
+             gs->game_over = true;
+             int max_pts = 0;
+             int best_player = -1;
+             for(int i=0; i<MAX_PLAYERS; i++) {
+                 PlayerState *p = &gs->players[i];
+                 if (p->active && p->points <= 21) {
+                     if (p->points > max_pts) {
+                         max_pts = p->points;
+                         best_player = i;
+                     }
+                 }
+             }
+             gs->winner = best_player;
+        }
+
+        sem_post(gs->turn_sem);
+        printf("[SERVER Player %d] Turn pass complete. Re-entering loop.\n", player_id);
     }
-    
-    // 清理退出
-    sem_wait(game_state->turn_sem);
-    game_state->players[player_id-1].connected = false;
-    game_state->connected_count--;
-    sem_post(game_state->turn_sem);
-    
-    printf("[Child %d] Exiting\n", getpid());
+
+    // Cleanup
+    close(client_sock);
+    sem_wait(gs->score_sem);
+    gs->players[player_id].connected = false;
+    gs->active_count--;
+    sem_post(gs->score_sem);
     exit(0);
 }
 
 int main() {
-    printf("=== Blackjack Server (MiniOS) ===\n");
-    printf("PID: %d\n", getpid());
-    
-    // 信号处理
-    signal(SIGINT, handle_sigint);
-    signal(SIGCHLD, handle_sigchld);
-    
-    // 初始化共享内存
-    game_state = init_shared_memory();
-    if (!game_state) {
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    // 1. Setup Shared Memory
+    gs = init_shared_memory();
+    if (!gs) {
         fprintf(stderr, "Failed to init shared memory\n");
-        return 1;
+        exit(1);
     }
     
-    // 创建内部线程
-    pthread_t sched_tid, log_tid;
-    pthread_create(&sched_tid, NULL, scheduler_thread, NULL);
-    pthread_create(&log_tid, NULL, logger_thread, NULL);
-    
-    printf("[Main] Threads created. Waiting for players...\n");
-    
-    // Fork子进程处理玩家（模拟3个玩家）
-    for (int i = 1; i <= 3 && running; i++) {
-        pid_t pid = fork();
-        
-        if (pid < 0) {
-            perror("fork");
+    // Initialize Game Logic (shuffle deck, etc)
+    init_game_state_struct(gs);
+
+    // 2. Setup Network
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("Socket failed");
+        exit(1);
+    }
+    int opt = 1;
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(8888);
+
+    if (bind(server_sock, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        exit(1);
+    }
+
+    if (listen(server_sock, MAX_PLAYERS) < 0) {
+        perror("Listen failed");
+        exit(1);
+    }
+
+    printf("Blackjack Server running on port 8888...\n");
+
+    // 3. Accept Loop
+    int client_idx = 0;
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+        int new_socket = accept(server_sock, (struct sockaddr *)&client_addr, &addrlen);
+        if (new_socket < 0) {
+            perror("Accept failed");
             continue;
         }
+
+        printf("New connection: Player %d\n", client_idx);
         
+        pid_t pid = fork();
         if (pid == 0) {
-            // 子进程
-            client_process(i);
+            // Child
+            close(server_sock); // Child doesn't listen
+            handle_client(new_socket, client_idx);
+            exit(0);
+        } else if (pid > 0) {
+            // Parent
+            close(new_socket); // Parent doesn't handle client
+            client_idx = (client_idx + 1) % MAX_PLAYERS;
+            // Wait for zombies? 
+            // signal(SIGCHLD, SIG_IGN) is easiest way to avoid zombies
+            signal(SIGCHLD, SIG_IGN);
         } else {
-            printf("[Main] Forked player %d (PID: %d)\n", i, pid);
+            perror("Fork failed");
         }
-        
-        sleep(1); // 间隔启动
     }
-    
-    // 主循环
-    while (running) {
-        sleep(1);
-        print_game_state(game_state);
-    }
-    
-    // 清理
-    printf("[Main] Cleaning up...\n");
-    pthread_join(sched_tid, NULL);
-    pthread_join(log_tid, NULL);
-    cleanup_shared_memory();
-    
-    printf("[Main] Server stopped\n");
+
     return 0;
 }
