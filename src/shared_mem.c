@@ -1,103 +1,102 @@
+// src/shared_mem.c
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <semaphore.h>
 #include <string.h>
 #include <unistd.h>
-#include "game_state.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include "../include/game_state.h"
 
-// 初始化共享内存
+// Forward declaration if not in header, but it is in game_logic.c usually. 
+// For now, we initialize simple state here.
+
 GameState* init_shared_memory() {
-    int fd;
-    GameState *gs;
-    
-    // 1. 创建共享内存对象
-    fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) {
-        perror("shm_open");
+    // 1. Create shared memory object
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open failed");
         return NULL;
     }
-    
-    // 2. 设置大小
-    if (ftruncate(fd, sizeof(GameState)) < 0) {
-        perror("ftruncate");
-        close(fd);
-        return NULL;
-    }
-    
-    // 3. 内存映射
-    gs = mmap(NULL, sizeof(GameState), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (gs == MAP_FAILED) {
-        perror("mmap");
-        close(fd);
-        return NULL;
-    }
-    close(fd);
-    
-    // 4. 首次使用时初始化
-    static int first_time = 1;
-    if (first_time) {
-        memset(gs, 0, sizeof(GameState));
-        
-        // 初始化玩家
-        for (int i = 0; i < MAX_PLAYERS; i++) {
-            gs->players[i].player_id = i + 1;
-            for (int j = 0; j < MAX_CARDS; j++) {
-                gs->players[i].cards[j] = -1;
-            }
-        }
-        
-        // 初始化牌堆
-        for (int i = 0; i < DECK_SIZE; i++) {
-            gs->deck[i] = (i % 13) + 1;
-        }
-        
-        first_time = 0;
-        printf("[SHM] First-time initialization complete\n");
-    }
-    
-    // 5. 创建信号量（进程共享）
-    gs->turn_sem = sem_open(SEM_TURN, O_CREAT, 0666, 1);
-    gs->deck_sem = sem_open(SEM_DECK, O_CREAT, 0666, 1);
-    gs->score_sem = sem_open(SEM_SCORE, O_CREAT, 0666, 1);
-    
-    if (gs->turn_sem == SEM_FAILED || 
-        gs->deck_sem == SEM_FAILED || 
-        gs->score_sem == SEM_FAILED) {
-        perror("sem_open");
-        cleanup_shared_memory();
-        return NULL;
-    }
-    
-    printf("[SHM] Ready at %p\n", (void*)gs);
-    return gs;
-}
 
-// 清理共享内存
-void cleanup_shared_memory() {
+    // 2. Set size
+    if (ftruncate(shm_fd, sizeof(GameState)) == -1) {
+        perror("ftruncate failed");
+        return NULL;
+    }
+
+    // 3. Map into memory
+    GameState *gs = mmap(NULL, sizeof(GameState), 
+                         PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (gs == MAP_FAILED) {
+        perror("mmap failed");
+        return NULL;
+    }
+
+    // 4. Initialize Semaphores
+    // Note: sem_open is better for unrelated processes, but here we can stick pointers 
+    // in SHM if we use sem_init(..., 1, ...) for process-shared, 
+    // BUT mapped memory addresses might differ. 
+    // Named semaphores are safer for cross-process if we don't store the pointers in SHM directly 
+    // but reopen them. However, standard pattern: use named semaphores and store names? 
+    // Or just open them in main and children.
+    
+    // For simplicity with the struct provided which has sem_t* pointers: 
+    // Putting pointers to local sem_open'd semaphores in SHM is risky if address space differs.
+    // However, unrelated processes usually mapped the SHM to different addresses.
+    // Better strategy for this struct: 
+    // The struct has sem_t *turn_sem. A pointer in SHM points to 'somewhere'. 
+    // If we want process-shared unnamed semaphores, they must be IN the SHM struct itself, not pointers.
+    // The struct definition in header has `sem_t *turn_sem`. This suggests the AUTHOR intended named semaphores 
+    // or didn't think about address spaces. 
+    // We will use named semaphores and ignore the pointer fields in SHM for cross-process invocation, 
+    // OR we change the struct. 
+    // Let's assume we stick to the header. We will use named semaphores. 
+    // Each process should open the named semaphore. 
+    // But init only needs to CREATE them.
+    
+    // Unlink old semaphores to ensure fresh start
     sem_unlink(SEM_TURN);
     sem_unlink(SEM_DECK);
     sem_unlink(SEM_SCORE);
-    shm_unlink(SHM_NAME);
-    printf("[SHM] Cleanup done\n");
+
+    sem_t *sem_turn = sem_open(SEM_TURN, O_CREAT, 0666, 1);
+    sem_t *sem_deck = sem_open(SEM_DECK, O_CREAT, 0666, 1);
+    sem_t *sem_score = sem_open(SEM_SCORE, O_CREAT, 0666, 1);
+
+    if (sem_turn == SEM_FAILED || sem_deck == SEM_FAILED || sem_score == SEM_FAILED) {
+        perror("sem_open failed");
+        return NULL;
+    }
+
+    // We can store these if the struct is just internal. 
+    // But since it's shared, putting local pointers is bad.
+    // However, if we fork(), the child inherits the address space copy (COW), 
+    // so the pointers MIGHT be valid if they point to library memory? No.
+    // Named semaphores return a pointer to the semaphore.
+    // Let's just create them here. The server main will hold them. 
+    // We will populate the struct pointers just in case, but rely on reopening if needed.
+    
+    gs->turn_sem = sem_turn;
+    gs->deck_sem = sem_deck;
+    gs->score_sem = sem_score;
+
+    return gs;
 }
 
-// 调试函数
-void print_game_state(GameState *gs) {
-    if (!gs) return;
-    
-    printf("\n=== Game State ===\n");
-    printf("Turn: P%d | Active: %d | Connected: %d\n",
-           gs->current_turn + 1, gs->active_count, gs->connected_count);
-    
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        PlayerState *p = &gs->players[i];
-        if (p->connected) {
-            printf("P%d: Cards=%d Points=%d %s\n",
-                   p->player_id, p->card_count, p->points,
-                   p->standing ? "(STAND)" : "");
-        }
+void cleanup_shared_memory(GameState *gs) {
+    if (gs) {
+        // Destroy semaphores logic. 
+        // In named semaphores, we close and unlink.
+        sem_close(gs->turn_sem);
+        sem_close(gs->deck_sem);
+        sem_close(gs->score_sem);
+        
+        munmap(gs, sizeof(GameState));
     }
-    printf("==================\n");
+    shm_unlink(SHM_NAME);
+    sem_unlink(SEM_TURN);
+    sem_unlink(SEM_DECK);
+    sem_unlink(SEM_SCORE);
 }

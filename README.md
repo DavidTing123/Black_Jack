@@ -1,16 +1,72 @@
-# Black_Jack
-This project is a server based on a hybrid concurrency model, developed in C under a Linux environment. It supports 3to5 players participating in the game through a command-line interface, using a combination of processes (fork) and threads (pthread) architecture to achieve player session isolation and concurrent execution of internal server tasks.
+# Multiplayer Black Jack Game
 
-## How to Run
+A multiplayer console-based Black Jack game (Server/Client architecture) developed in C.
 
-1.  **Clean and Rebuild** (Ensures fresh compile):
-    ```bash
-    make clean && make
-    ```
+## 🃏 Game Rules
 
-2.  **Run the Server**:
-    ```bash
-    ./server
-    ```
-    The server will automatically fork 3 player processes. The game runs automatically until all players stand, at which point it terminates.
+**Objective**: Beat the other players by getting a hand value closest to **21** without going over (Bust).
 
+1.  **Card Values**:
+    -   **2-10**: Worth their face value.
+    -   **J, Q, K**: Worth **10** points each.
+    -   **Ace (A)**: Worth **11** or **1** (automatically adjusts to avoid busting).
+2.  **Gameplay**:
+    -   The game is turn-based.
+    -   Players are dealt **2 initial cards**.
+    -   On your turn, you can choose to:
+        -   **Hit**: Take another card. The turn passes to the next player.
+        -   **Stand**: Keep your current hand and stop playing.
+3.  **Winning**:
+    -   If you exceed 21 points, you **Bust** and are out.
+    -   When all players have stood or busted, the game ends.
+    -   The player with the highest score (<= 21) is declared the **Winner**.
+
+## 🛠️ How to Compile
+
+This project uses a `Makefile` for easy compilation. Open your terminal in the project folder and run:
+
+```bash
+make all
+```
+
+This will create two executable files: `server` and `client`.
+
+## 🚀 How to Run
+
+You will need to run the server first, and then open separate terminals for each player.
+
+### 1. Start the Server
+Open a terminal and run:
+```bash
+./server
+```
+You will see: `Blackjack Server running on port 8888...`
+
+### 2. Start Players (Clients)
+Open a **new terminal window** implementation for each player you want to join.
+
+**Player 0:**
+```bash
+./client
+```
+**Player 1:**
+```bash
+./client
+```
+*(Repeat for up to 5 players)*
+
+## 🎮 Controls
+
+When it is your turn, the game will prompt you:
+```text
+Your turn! Hand: 15 points. (hit/stand)
+```
+
+Type one of the following commands and press Enter:
+-   **`hit`** : Draw a new card.
+-   **`stand`** : End your turn for the game.
+
+## 🧪 Technical Details
+-   **Architecture**: Client-Server (TCP Sockets).
+-   **Concurrency**: Hybrid model using `fork()` for client handling and `pthread` for internal tasks.
+-   **IPC**: Uses Shared Memory and Named Semaphores to synchronize game state between processes.

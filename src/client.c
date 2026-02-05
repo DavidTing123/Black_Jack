@@ -17,11 +17,13 @@ int main() {
     char buffer[BUFFER_SIZE];
     int my_player_id = -1;
 
-    // Receive welcome message + player ID
+    // Receive welcome message
     if (receive_message(sockfd, buffer, sizeof(buffer))) {
         printf("%s", buffer);
-        // Assume server sends: "Welcome! You are Player X"
-        sscanf(buffer, "Welcome! You are Player %d", &my_player_id);
+        // Updated parsing to match "Welcome! Player %d" or similar
+        if (sscanf(buffer, "Welcome! Player %d", &my_player_id) != 1) {
+            sscanf(buffer, "Welcome! You are Player %d", &my_player_id);
+        }
     }
 
     while (1) {
@@ -30,21 +32,16 @@ int main() {
             break;
         }
 
-        printf("\n%s\n", buffer);
+        printf("%s\n", buffer);
 
-        // Simple parsing - server should send clear prompts
-        if (strstr(buffer, "Your turn") != NULL) {
+        // Check for action prompt
+        if (strstr(buffer, "hit or stand?") != NULL) {
             printf("Your action (hit / stand): ");
             char command[32];
-            fgets(command, sizeof(command), stdin);
-            command[strcspn(command, "\n")] = 0;  // remove newline
-
-            if (strcmp(command, "hit") == 0 || strcmp(command, "stand") == 0) {
-                char msg[64];
-                snprintf(msg, sizeof(msg), "%s", command);
-                send_message(sockfd, msg);
-            } else {
-                printf("Invalid command. Use 'hit' or 'stand'\n");
+            fflush(stdout);
+            if (fgets(command, sizeof(command), stdin) != NULL) {
+                command[strcspn(command, "\n")] = 0;  // remove newline
+                send_message(sockfd, command);
             }
         }
 
