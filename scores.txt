@@ -1,0 +1,5 @@
+Player 0: Wins=1, Losses=6, Highest=18
+Player 1: Wins=4, Losses=3, Highest=21
+Player 2: Wins=2, Losses=5, Highest=21
+Player 3: Wins=0, Losses=0, Highest=0
+Player 4: Wins=0, Losses=0, Highest=0
